@@ -1,26 +1,25 @@
 /**
- * Binaural UI — Anti-Tear Build (frame pacing + tiny redraws)
+ * Binaural UI — Stable UI Build (dirty redraws + single flush)
  *
- * Keys (USB Serial @115200):
+ * Keys (USB Serial @115200; press the key, no Enter):
  *   g            start session
  *   p            pause/resume
  *   x            stop/reset
  *   + / -        minutes +1 / -1  (1..60)
- *   1/2/3/4      presets (Alpha/Beta/Theta/Delta)
- *   q / a        base +5 / -5      (min 20)
- *   w / s        beat +0.5 / -0.5  (clamped to preset)
+ *   1 / 2 / 3 / 4  presets (Alpha / Beta / Theta / Delta)
+ *   q / a        base +5 / -5      (min 20 Hz)
+ *   w / s        beat +0.5 / -0.5  (clamped to preset range)
  *   r            reset base/beat to preset defaults
- *   t            toggle beat RAMP-IN on/off
- *   [ / ]        ramp duration -5s / +5s (0..300s)
- *   f            toggle FPS overlay
+ *   z            full UI redraw (safety)
+ *   h            print banner + controls to Serial (on demand)
+ *   m            print current memory stats to Serial
  *
  * Notes:
- * - We pace frames to the panel refresh to avoid tearing:
- *     PCLK=16 MHz (~31 Hz refresh) -> frame ~32 ms
- *     PCLK=32 MHz (~62 Hz refresh) -> frame ~16 ms
- * - Visualizer draws only the changed strip each frame.
- * - Header shows TARGET beat (stable). Effective/ramped beat shown in footer at 4 Hz.
+ * - Auto-flush is disabled; we call gfx->flush() once per loop after tiny redraws.
+ * - Visualizer updates a narrow strip to keep bandwidth low and prevent tearing.
+ * - Keep PCLK at 16 MHz while developing; 32 MHz is OK later if cabling is short/clean.
  */
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>   // for fabsf
@@ -30,6 +29,75 @@ using namespace esp_expander;
 
 #include <databus/Arduino_ESP32RGBPanel.h>
 #include <display/Arduino_RGB_Display.h>
+
+/* --------------------------------------------------------------------------
+   AudioEngine scaffold (no sound yet)
+   - Mirrors UI controls so we can plug in I2S/USB audio later without UI edits
+----------------------------------------------------------------------------*/
+class AudioEngine {
+public:
+  enum class State : uint8_t { Stopped, Running, Paused };
+
+  bool begin() {
+    _ok = true;
+    _lastLogMs = 0;
+    return _ok;
+  }
+
+  void setBaseHz(float hz)  { _base = hz;   _dirty = true; }
+  void setBeatHz(float hz)  { _beat = hz;   _dirty = true; }
+
+  void start() {
+    if (!_ok) return;
+    if (_state == State::Running) return;
+    _state = State::Running;
+    _dirty = true;
+  }
+
+  void pause() {
+    if (_state != State::Running) return;
+    _state = State::Paused;
+    _dirty = true;
+  }
+
+  void stop() {
+    _state = State::Stopped;
+    _dirty = true;
+  }
+
+  void update() {
+    if (!_ok) return;
+    uint32_t now = millis();
+    if (_dirty || now - _lastLogMs > 1000) {
+      _lastLogMs = now;
+      _dirty = false;
+      float fL = _base - (_beat * 0.5f);
+      float fR = _base + (_beat * 0.5f);
+      (void)fL; (void)fR;
+      // Serial.printf("[AUDIO] %s  base=%.2f  beat=%.2f  L=%.2f  R=%.2f\n",
+      //   stateName(), _base, _beat, fL, fR);
+    }
+  }
+
+  const char* stateName() const {
+    switch (_state) {
+      case State::Stopped: return "Stopped";
+      case State::Running: return "Running";
+      case State::Paused:  return "Paused";
+    }
+    return "";
+  }
+
+private:
+  bool     _ok   = false;
+  bool     _dirty = true;
+  State    _state = State::Stopped;
+  float    _base = 200.0f;
+  float    _beat = 10.0f;
+  uint32_t _lastLogMs = 0;
+};
+
+static AudioEngine audio; // global instance
 
 // ==================== Board wiring (Waveshare 4.3" Dev Board B) ====================
 static constexpr int I2C_SDA  = 8;
@@ -97,6 +165,10 @@ static uint8_t      lastMinutesDrawn = 0;
 static uint32_t     lastRemainSecDrawn = UINT32_MAX; // force first draw
 static float        lastProgress = -1.0f;
 
+// ===== Forward declarations =====
+void drawStaticOnce();
+void print_banner();
+
 // ==================== Helpers ====================
 void print_mem(const char* tag = "MEM")
 {
@@ -105,6 +177,14 @@ void print_mem(const char* tag = "MEM")
                 (uint32_t)(ESP.getFreeHeap() / 1024),
                 (uint32_t)(ESP.getPsramSize() / 1024),
                 (uint32_t)(ESP.getFreePsram() / 1024));
+}
+
+void print_banner()
+{
+  Serial.println("\n--- Binaural UI (Session + Timer + Audio scaffold) ---");
+  print_mem("BOOT/INFO");
+  Serial.println("[BL] Backlight enabled (EXIO2 HIGH)  (if screen is lit)");
+  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
 }
 
 void backlight_on()
@@ -137,6 +217,10 @@ void applyPreset(int idx)
   presetIdx = idx;
   baseHz = PRESETS[idx].baseHz;
   beatHz = PRESETS[idx].beatHz;
+
+  // reflect to audio engine
+  audio.setBaseHz(baseHz);
+  audio.setBeatHz(beatHz);
 }
 
 void startSession()
@@ -146,6 +230,8 @@ void startSession()
   state = SessionState::RUNNING;
   sessionStartMs = millis();
   lastSecondTick = 0; // force immediate countdown refresh
+
+  audio.start();
 }
 
 void pauseSessionToggle()
@@ -154,10 +240,12 @@ void pauseSessionToggle()
     // accumulate time up to now
     accumulatedMs += (millis() - sessionStartMs);
     state = SessionState::PAUSED;
+    audio.pause();
   } else if (state == SessionState::PAUSED) {
     // resume
     sessionStartMs = millis();
     state = SessionState::RUNNING;
+    audio.start(); // resume audio
   }
 }
 
@@ -166,6 +254,7 @@ void stopSession()
   state = SessionState::IDLE;
   accumulatedMs = 0;
   lastSecondTick = 0;
+  audio.stop();
 }
 
 uint32_t sessionElapsedMs()
@@ -194,18 +283,39 @@ void handleSerial()
       case '4': applyPreset(3); break;
 
       // base / beat
-      case 'q': baseHz += 5.0f; break;
-      case 'a': baseHz -= 5.0f; if (baseHz < 20.0f) baseHz = 20.0f; break;
-      case 'w': beatHz += 0.5f; break;
-      case 's': beatHz -= 0.5f; break;
-      case 'r': baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz; break;
+      case 'q': baseHz += 5.0f; audio.setBaseHz(baseHz); break;
+      case 'a': baseHz -= 5.0f; if (baseHz < 20.0f) baseHz = 20.0f; audio.setBaseHz(baseHz); break;
+      case 'w': beatHz += 0.5f; audio.setBeatHz(beatHz); break;
+      case 's': beatHz -= 0.5f; audio.setBeatHz(beatHz); break;
+      case 'r': baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz;
+                audio.setBaseHz(baseHz); audio.setBeatHz(beatHz); break;
 
       // session controls
       case 'g': startSession(); break;     // go
       case 'p': pauseSessionToggle(); break;
       case 'x': stopSession(); break;
+
+      // duration
       case '+': if (sessionMinutes < 60) sessionMinutes++; break;
       case '-': if (sessionMinutes > 1)  sessionMinutes--; break;
+
+      // UI refresh (safety)
+      case 'z': // Redraw everything if anything ever looks off
+        gfx->fillScreen(BLACK);
+        // reset caches so everything repaints cleanly
+        lastBase = NAN; lastBeat = NAN; lastLeft = NAN; lastRight = NAN;
+        lastPreset = -1; lastPausedFlag = !lastPausedFlag;
+        lastVizX = -1;
+        lastStateDrawn = SessionState::DONE; // force different
+        lastMinutesDrawn = 255;
+        lastRemainSecDrawn = UINT32_MAX;
+        lastProgress = -1.0f;
+        drawStaticOnce();
+        break;
+
+      // serial convenience
+      case 'h': print_banner(); break;          // re-print controls + mem header
+      case 'm': print_mem("NOW"); break;        // dump current memory
 
       default: break;
     }
@@ -287,25 +397,9 @@ void drawFreqsIfChanged()
     gfx->setTextColor(WHITE); gfx->setTextSize(2);
     gfx->setCursor(40, 260); gfx->printf("Carrier/Base: %.2f Hz", baseHz);
     gfx->setCursor(40, 290); gfx->printf("Beat Delta:   %.2f Hz  (L = base - beat/2, R = base + beat/2)", beatHz);
-    gfx->setCursor(40, 320); gfx->print("Serial: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes");
+    gfx->setCursor(40, 320); gfx->print("Serial: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
     lastBase = baseHz; lastBeat = beatHz;
   }
-}
-
-void drawVisualizerThin(float t)
-{
-  float speed = beatHz;
-  if (speed < 0.5f) speed = 0.5f;
-  if (speed > 30.0f) speed = 30.0f;
-  speed /= 30.0f; // 0..1
-
-  int x = 40 + (int)(sin(t * speed * 2.0f * PI) * 200.0f + 200.0f);
-
-  if (lastVizX >= 0) {
-    gfx->fillRect(40, 340, lastVizX, 12, 0x10A2); // erase old segment
-  }
-  gfx->fillRect(40, 340, x, 12, 0xFBE0);          // draw new segment
-  lastVizX = x;
 }
 
 void drawSessionPanelIfChanged()
@@ -367,9 +461,8 @@ void drawSessionPanelIfChanged()
 void setup()
 {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("\n--- Binaural UI (Session + Timer) ---");
-  print_mem("BOOT");
+  delay(150);            // small settle so early prints are not missed
+  print_banner();        // print on demand later with 'h'
 
   // PSRAM check
   if (ESP.getPsramSize() < 4 * 1024 * 1024) {
@@ -385,6 +478,11 @@ void setup()
     Serial.println("[ERR] gfx->begin() failed");
     for (;;) delay(1000);
   }
+
+  // AudioEngine init (no audio yet; prepares for I2S later)
+  audio.begin();
+  audio.setBaseHz(baseHz);
+  audio.setBeatHz(beatHz);
 
   print_mem("POST-begin");
 
@@ -404,7 +502,7 @@ void setup()
   // Push the composed frame
   gfx->flush();
 
-  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes");
+  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
 }
 
 void loop()
@@ -414,13 +512,18 @@ void loop()
   // Engine + UI updates regardless of session, but animated parts only when not paused/done
   computeEngine();
 
+  // reflect current values to AudioEngine (cheap; it coalesces updates)
+  audio.setBaseHz(baseHz);
+  audio.setBeatHz(beatHz);
+  audio.update();
+
   // Header / numeric readouts update if changed
   drawHeaderIfChanged();
   drawFreqsIfChanged();
 
-  // Session UI: update countdown once/sec or when state changes
+  // Session UI: update countdown ~4 Hz for responsiveness without heavy repaint
   uint32_t now = millis();
-  if (now - lastSecondTick >= 250) { // small cadence for responsive countdown/progress
+  if (now - lastSecondTick >= 250) {
     lastSecondTick = now;
     drawSessionPanelIfChanged();
   }
@@ -429,7 +532,13 @@ void loop()
   if (state != SessionState::PAUSED) {
     static uint32_t t0 = millis();
     float t = (millis() - t0) / 1000.0f;
-    drawVisualizerThin(t);
+    // same thin bar logic as before
+    float speed = beatHz; if (speed < 0.5f) speed = 0.5f; if (speed > 30.0f) speed = 30.0f;
+    speed /= 30.0f;
+    int x = 40 + (int)(sin(t * speed * 2.0f * PI) * 200.0f + 200.0f);
+    if (lastVizX >= 0) gfx->fillRect(40, 340, lastVizX, 12, 0x10A2);
+    gfx->fillRect(40, 340, x, 12, 0xFBE0);
+    lastVizX = x;
   }
 
   // Heartbeat pixel (top-left)
@@ -440,6 +549,7 @@ void loop()
   // If session completed, mark DONE once and freeze visuals (except heartbeat)
   if (state == SessionState::RUNNING && sessionElapsedMs() >= sessionTotalMs()) {
     state = SessionState::DONE;
+    audio.stop();
   }
 
   // Push the frame once per loop
