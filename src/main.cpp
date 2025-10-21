@@ -1,110 +1,85 @@
 /**
- * Binaural UI — Stable UI Build (dirty redraws + single flush)
- *
- * Keys (USB Serial @115200; press the key, no Enter):
- *   g            start session
- *   p            pause/resume
- *   x            stop/reset
- *   + / -        minutes +1 / -1  (1..60)
- *   1 / 2 / 3 / 4  presets (Alpha / Beta / Theta / Delta)
- *   q / a        base +5 / -5      (min 20 Hz)
- *   w / s        beat +0.5 / -0.5  (clamped to preset range)
- *   r            reset base/beat to preset defaults
- *   z            full UI redraw (safety)
- *   h            print banner + controls to Serial (on demand)
- *   m            print current memory stats to Serial
- *
- * Notes:
- * - Auto-flush is disabled; we call gfx->flush() once per loop after tiny redraws.
- * - Visualizer updates a narrow strip to keep bandwidth low and prevent tearing.
- * - Keep PCLK at 16 MHz while developing; 32 MHz is OK later if cabling is short/clean.
+ * LVGL UI — Binaural Session (Readable Fonts Edition)
+ * - Big fonts, high contrast, increased spacing
+ * - Same functionality as previous LVGL build
  */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>   // for fabsf
+#include <math.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 
-#include <esp_io_expander.hpp>   // CH422G over I2C
+#include <esp_io_expander.hpp>
 using namespace esp_expander;
 
 #include <databus/Arduino_ESP32RGBPanel.h>
 #include <display/Arduino_RGB_Display.h>
 
-/* --------------------------------------------------------------------------
-   AudioEngine scaffold (no sound yet)
-   - Mirrors UI controls so we can plug in I2S/USB audio later without UI edits
-----------------------------------------------------------------------------*/
-class AudioEngine {
-public:
-  enum class State : uint8_t { Stopped, Running, Paused };
+#include <lvgl.h>
 
-  bool begin() {
-    _ok = true;
-    _lastLogMs = 0;
-    return _ok;
-  }
+/* ------------------------------ App Model ------------------------------ */
 
-  void setBaseHz(float hz)  { _base = hz;   _dirty = true; }
-  void setBeatHz(float hz)  { _beat = hz;   _dirty = true; }
-
-  void start() {
-    if (!_ok) return;
-    if (_state == State::Running) return;
-    _state = State::Running;
-    _dirty = true;
-  }
-
-  void pause() {
-    if (_state != State::Running) return;
-    _state = State::Paused;
-    _dirty = true;
-  }
-
-  void stop() {
-    _state = State::Stopped;
-    _dirty = true;
-  }
-
-  void update() {
-    if (!_ok) return;
-    uint32_t now = millis();
-    if (_dirty || now - _lastLogMs > 1000) {
-      _lastLogMs = now;
-      _dirty = false;
-      float fL = _base - (_beat * 0.5f);
-      float fR = _base + (_beat * 0.5f);
-      (void)fL; (void)fR;
-      // Serial.printf("[AUDIO] %s  base=%.2f  beat=%.2f  L=%.2f  R=%.2f\n",
-      //   stateName(), _base, _beat, fL, fR);
-    }
-  }
-
-  const char* stateName() const {
-    switch (_state) {
-      case State::Stopped: return "Stopped";
-      case State::Running: return "Running";
-      case State::Paused:  return "Paused";
-    }
-    return "";
-  }
-
-private:
-  bool     _ok   = false;
-  bool     _dirty = true;
-  State    _state = State::Stopped;
-  float    _base = 200.0f;
-  float    _beat = 10.0f;
-  uint32_t _lastLogMs = 0;
+struct Preset {
+  const char* name;
+  float baseHz;
+  float beatHz;
+  float beatMin;
+  float beatMax;
 };
 
-static AudioEngine audio; // global instance
+static Preset PRESETS[] = {
+  {"Alpha", 200.0f, 10.0f,  8.0f, 12.0f},
+  {"Beta",  220.0f, 18.0f, 13.0f, 30.0f},
+  {"Theta", 180.0f,  6.0f,  4.0f,  7.0f},
+  {"Delta", 150.0f,  2.0f,  0.5f,  3.0f}
+};
 
-// ==================== Board wiring (Waveshare 4.3" Dev Board B) ====================
+enum class SessionState : uint8_t { IDLE, RUNNING, PAUSED, DONE };
+
+static int   presetIdx = 0;
+static float baseHz    = PRESETS[0].baseHz;
+static float beatHz    = PRESETS[0].beatHz;
+static float fLeft     = 0.0f;
+static float fRight    = 0.0f;
+
+static SessionState state = SessionState::IDLE;
+static uint8_t  sessionMinutes = 10;
+static uint32_t sessionStartMs = 0;
+static uint32_t accumulatedMs  = 0;
+
+static inline void computeEngine() {
+  const Preset& p = PRESETS[presetIdx];
+  if (beatHz < p.beatMin) beatHz = p.beatMin;
+  if (beatHz > p.beatMax) beatHz = p.beatMax;
+  fLeft  = baseHz - (beatHz * 0.5f);
+  fRight = baseHz + (beatHz * 0.5f);
+}
+static inline uint32_t sessionElapsedMs() {
+  if (state == SessionState::RUNNING) return accumulatedMs + (millis() - sessionStartMs);
+  return accumulatedMs;
+}
+static inline uint32_t sessionTotalMs() { return (uint32_t)sessionMinutes * 60u * 1000u; }
+
+/* ------------------------- Hardware: Backlight ------------------------- */
 static constexpr int I2C_SDA  = 8;
 static constexpr int I2C_SCL  = 9;
-static constexpr int I2C_PORT = 0;      // ESP32-S3 I2C controller index
+static constexpr int I2C_PORT = 0;
+static CH422G *blExpander = nullptr;
+static constexpr int EXIO_BL = 2; // EXIO2
 
-// ==================== RGB pins + timing for 800x480 panel ====================
+static void backlight_on() {
+  if (!blExpander) {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    blExpander = new CH422G(I2C_PORT, I2C_SDA, I2C_SCL);
+    if (!blExpander->begin()) { Serial.println("[BL] CH422G begin() FAILED"); return; }
+  }
+  blExpander->pinMode(EXIO_BL, OUTPUT);
+  blExpander->digitalWrite(EXIO_BL, HIGH);
+  Serial.println("[BL] Backlight enabled (EXIO2 HIGH)");
+}
+
+/* ------------------------ Hardware: RGB Display ------------------------ */
 Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
   /* DE,VS,HS,PCLK */ 5, 3, 46, 7,
   /* R0..R4 */ 1, 2, 42, 41, 40,
@@ -112,449 +87,316 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
   /* B0..B4 */ 14, 38, 18, 17, 10,
   /* hsync_pol */ 0, /* hfp,hsync,hbp */ 40, 48, 88,
   /* vsync_pol */ 0, /* vfp,vsync,vbp */ 13, 3, 32,
-  /* pclk_neg */ 1,  /* prefer speed */ 16000000   // Try 32000000 later for ~60 Hz
+  /* pclk_neg */ 1,  /* prefer speed */ 16000000
 );
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(800, 480, rgbpanel, 0, false);
 
-// Display object (auto_flush = false so we control when pixels are pushed)
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-  800, 480, rgbpanel, 0 /* rotation */, false /* auto_flush */
-);
+/* ----------------------------- LVGL glue ------------------------------ */
+static lv_display_t* disp;
+static lv_obj_t*  headerLabel;
+static lv_obj_t*  lrLabel;
+static lv_obj_t*  beatSlider;
+static lv_obj_t*  beatValueLabel;
+static lv_obj_t*  presetBtns[4];
+static lv_obj_t*  startBtn;
+static lv_obj_t*  pauseBtn;
+static lv_obj_t*  stopBtn;
+static lv_obj_t*  minutesSB;
+static lv_obj_t*  minutesMinusBtn;
+static lv_obj_t*  minutesPlusBtn;
+static lv_obj_t*  timeLeftLabel;
+static lv_obj_t*  progressBar;
 
-// ==================== Backlight expander (CH422G) ====================
-CH422G *blExpander = nullptr;
-static constexpr int EXIO_BL = 2; // EXIO2 = BL-EN (on Waveshare “B” board)
+static constexpr int LV_BUF_LINES = 40;
+static lv_color_t* lv_buf1 = nullptr;
+static lv_color_t* lv_buf2 = nullptr;
 
-// ==================== Binaural engine model (math only for now) ====================
-struct Preset {
-  const char* name;
-  float baseHz;   // carrier (e.g., 200 Hz)
-  float beatHz;   // L/R delta (e.g., 10 Hz for alpha)
-  float beatMin;
-  float beatMax;
-};
+static void lvgl_flush_cb(lv_display_t* display, const lv_area_t* area, uint8_t* px_map) {
+  const int x = area->x1, y = area->y1;
+  const int w = area->x2 - area->x1 + 1;
+  const int h = area->y2 - area->y1 + 1;
+  uint16_t* p = reinterpret_cast<uint16_t*>(px_map);
+  gfx->draw16bitRGBBitmap(x, y, p, w, h);
+  lv_disp_flush_ready(display);
+}
+static void lvgl_tick_cb(void*) { lv_tick_inc(5); }
 
-Preset PRESETS[] = {
-  {"Alpha", 200.0f, 10.0f,  8.0f, 12.0f},
-  {"Beta",  220.0f, 18.0f, 13.0f, 30.0f},
-  {"Theta", 180.0f,  6.0f,  4.0f,  7.0f},
-  {"Delta", 150.0f,  2.0f,  0.5f,  3.0f}
-};
-static int   presetIdx = 0;
-static float baseHz = PRESETS[0].baseHz;
-static float beatHz = PRESETS[0].beatHz;
-
-// Computed each frame
-static float fLeft = 0.0f, fRight = 0.0f;
-
-// ==================== Session state ====================
-enum class SessionState : uint8_t { IDLE, RUNNING, PAUSED, DONE };
-static SessionState state = SessionState::IDLE;
-static uint8_t  sessionMinutes = 10;         // editable 1..60
-static uint32_t sessionStartMs  = 0;          // when RUNNING actually began (excludes paused time)
-static uint32_t accumulatedMs   = 0;          // time already accumulated before current run segment
-static uint32_t lastSecondTick  = 0;          // to update countdown text once/sec
-
-// ==================== Dirty-state caches (to minimize redraw) ====================
-static float lastBase = NAN, lastBeat = NAN, lastLeft = NAN, lastRight = NAN;
-static int   lastPreset = -1;
-static bool  lastPausedFlag = true; // mirrors PAUSED state for header text
-static int   lastVizX   = -1;
-
-static SessionState lastStateDrawn = SessionState::IDLE;
-static uint8_t      lastMinutesDrawn = 0;
-static uint32_t     lastRemainSecDrawn = UINT32_MAX; // force first draw
-static float        lastProgress = -1.0f;
-
-// ===== Forward declarations =====
-void drawStaticOnce();
-void print_banner();
-
-// ==================== Helpers ====================
-void print_mem(const char* tag = "MEM")
-{
+/* ----------------------------- Utilities ------------------------------ */
+static void print_mem(const char* tag) {
   Serial.printf("[%s] Heap free: %u KB | PSRAM size: %u KB | PSRAM free: %u KB\n",
-                tag,
-                (uint32_t)(ESP.getFreeHeap() / 1024),
-                (uint32_t)(ESP.getPsramSize() / 1024),
-                (uint32_t)(ESP.getFreePsram() / 1024));
+    tag, (uint32_t)(ESP.getFreeHeap()/1024), (uint32_t)(ESP.getPsramSize()/1024), (uint32_t)(ESP.getFreePsram()/1024));
 }
-
-void print_banner()
-{
-  Serial.println("\n--- Binaural UI (Session + Timer + Audio scaffold) ---");
+static void print_banner() {
+  Serial.println("\n--- LVGL Session UI (Readable Fonts) ---");
   print_mem("BOOT/INFO");
-  Serial.println("[BL] Backlight enabled (EXIO2 HIGH)  (if screen is lit)");
-  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
+  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z refresh | h help | m mem");
 }
 
-void backlight_on()
-{
-  if (!blExpander) {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    blExpander = new CH422G(I2C_PORT, I2C_SDA, I2C_SCL);
-    if (!blExpander->begin()) {
-      Serial.println("[BL] CH422G begin() FAILED (check I2C pins/port)");
-      return;
-    }
+/* --------------------------- Session helpers -------------------------- */
+static void startSession() { if (state!=SessionState::RUNNING){ if (state==SessionState::DONE) accumulatedMs=0; state=SessionState::RUNNING; sessionStartMs=millis(); } }
+static void pauseSessionToggle() {
+  if (state==SessionState::RUNNING){ accumulatedMs += (millis()-sessionStartMs); state=SessionState::PAUSED; }
+  else if (state==SessionState::PAUSED){ sessionStartMs=millis(); state=SessionState::RUNNING; }
+}
+static void stopSession() { state=SessionState::IDLE; accumulatedMs=0; }
+
+/* ---------------------------- LVGL Styles ----------------------------- */
+static lv_style_t style_bg;
+static lv_style_t style_text_small;   // 20 pt
+static lv_style_t style_text_large;   // 24 pt
+static lv_style_t style_btn;
+
+static void init_styles() {
+  lv_style_init(&style_bg);
+  lv_style_set_bg_color(&style_bg, lv_color_hex(0x000000));
+  lv_style_set_text_color(&style_bg, lv_color_hex(0xFFFFFF));
+  lv_obj_add_style(lv_screen_active(), &style_bg, 0);
+
+  lv_style_init(&style_text_small);
+  lv_style_set_text_color(&style_text_small, lv_color_hex(0xFFFFFF));
+  lv_style_set_text_font(&style_text_small, &lv_font_montserrat_20);
+
+  lv_style_init(&style_text_large);
+  lv_style_set_text_color(&style_text_large, lv_color_hex(0xFFFFFF));
+  lv_style_set_text_font(&style_text_large, &lv_font_montserrat_24);
+
+  lv_style_init(&style_btn);
+  lv_style_set_bg_color(&style_btn, lv_color_hex(0x303030));
+  lv_style_set_radius(&style_btn, 10);
+  lv_style_set_pad_all(&style_btn, 8);
+}
+
+/* ---------------------------- LVGL UI bits ---------------------------- */
+static void ui_update_header() {
+  char hdr[128];
+  snprintf(hdr, sizeof(hdr), "Preset: %s   Base: %.1f Hz   Beat: %.2f Hz",
+           PRESETS[presetIdx].name, baseHz, beatHz);
+  lv_label_set_text(headerLabel, hdr);
+}
+static void ui_update_lr() {
+  char lr[96];
+  snprintf(lr, sizeof(lr), "Left: %.2f Hz    Right: %.2f Hz", fLeft, fRight);
+  lv_label_set_text(lrLabel, lr);
+}
+static void ui_update_slider() {
+  if (!beatSlider) return;
+  lv_slider_set_value(beatSlider, (int32_t)lrintf(beatHz * 100.0f), LV_ANIM_OFF);
+  char bv[32];
+  snprintf(bv, sizeof(bv), "%.2f Hz", beatHz);
+  lv_label_set_text(beatValueLabel, bv);
+}
+static void ui_update_minutes() {
+  if (minutesSB) lv_spinbox_set_value(minutesSB, sessionMinutes);
+}
+static void ui_update_progress() {
+  if (!progressBar || !timeLeftLabel) return;
+  uint32_t total = sessionTotalMs();
+  uint32_t elapsed = sessionElapsedMs();
+  if (state == SessionState::RUNNING && elapsed >= total && total>0) state = SessionState::DONE;
+
+  lv_bar_set_range(progressBar, 0, (int32_t)total);
+  lv_bar_set_value(progressBar, (int32_t)min(elapsed, total), LV_ANIM_OFF);
+
+  uint32_t remain = (elapsed >= total) ? 0 : (total - elapsed);
+  uint32_t mm = remain / 60000u, ss = (remain % 60000u) / 1000u;
+  const char* sname = (state==SessionState::IDLE)?"IDLE":(state==SessionState::RUNNING)?"RUNNING":(state==SessionState::PAUSED)?"PAUSED":"DONE";
+
+  char tl[120];
+  snprintf(tl, sizeof(tl), "Session: %s   Duration: %u min   Time Left: %02u:%02u",
+           sname, (unsigned)sessionMinutes, (unsigned)mm, (unsigned)ss);
+  lv_label_set_text(timeLeftLabel, tl);
+}
+static void ui_sync_all() {
+  computeEngine();
+  ui_update_header();
+  ui_update_lr();
+  ui_update_slider();
+  ui_update_minutes();
+  ui_update_progress();
+}
+
+/* ------------------------------ Events ------------------------------- */
+static void beat_slider_event_cb(lv_event_t* e) {
+  lv_obj_t* slider = (lv_obj_t*) lv_event_get_target(e);
+  int32_t v = lv_slider_get_value(slider);  // centi-Hz
+  beatHz = v / 100.0f;
+  ui_sync_all();
+}
+static void preset_btn_event_cb(lv_event_t* e) {
+  uintptr_t idx = (uintptr_t) lv_event_get_user_data(e);
+  presetIdx = (int)idx;
+  baseHz = PRESETS[presetIdx].baseHz;
+  beatHz = PRESETS[presetIdx].beatHz;
+  ui_sync_all();
+}
+static void start_btn_event_cb(lv_event_t*) { startSession(); ui_update_progress(); }
+static void pause_btn_event_cb(lv_event_t*) { pauseSessionToggle(); ui_update_progress(); }
+static void stop_btn_event_cb(lv_event_t*)  { stopSession(); ui_update_progress(); }
+static void minutes_minus_event_cb(lv_event_t*) { if (sessionMinutes>1)  sessionMinutes--; ui_update_minutes(); ui_update_progress(); }
+static void minutes_plus_event_cb(lv_event_t*)  { if (sessionMinutes<60) sessionMinutes++; ui_update_minutes(); ui_update_progress(); }
+
+/* ------------------------------ Build UI ------------------------------ */
+static lv_obj_t* make_btn(lv_obj_t* parent, const char* txt, lv_event_cb_t cb, void* ud=nullptr, int w=120, int h=44) {
+  lv_obj_t* btn = lv_btn_create(parent);
+  lv_obj_add_style(btn, &style_btn, 0);
+  lv_obj_set_size(btn, w, h);
+  if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, ud);
+  lv_obj_t* lb = lv_label_create(btn);
+  lv_obj_add_style(lb, &style_text_small, 0);
+  lv_label_set_text(lb, txt);
+  lv_obj_center(lb);
+  return btn;
+}
+
+static void build_ui() {
+  init_styles();
+
+  // Header (big)
+  headerLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(headerLabel, &style_text_large, 0);
+  lv_obj_set_pos(headerLabel, 12, 10);
+
+  // L/R readout (big)
+  lrLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(lrLabel, &style_text_large, 0);
+  lv_obj_set_pos(lrLabel, 12, 48);
+
+  // Preset buttons row (tall & wide)
+  const int presY = 92, presX0 = 12, presW = 150, presH = 50, presGap = 10;
+  for (int i = 0; i < 4; ++i) {
+    presetBtns[i] = make_btn(lv_screen_active(), PRESETS[i].name, preset_btn_event_cb, (void*)(uintptr_t)i, presW, presH);
+    lv_obj_set_pos(presetBtns[i], presX0 + i*(presW + presGap), presY);
   }
-  blExpander->pinMode(EXIO_BL, OUTPUT);
-  blExpander->digitalWrite(EXIO_BL, HIGH);
-  Serial.println("[BL] Backlight enabled (EXIO2 HIGH)");
+
+  // Beat slider + labels (big)
+  lv_obj_t* beatLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(beatLabel, &style_text_large, 0);
+  lv_label_set_text(beatLabel, "Beat (Hz):");
+  lv_obj_set_pos(beatLabel, 12, 158);
+
+  beatSlider = lv_slider_create(lv_screen_active());
+  lv_obj_set_size(beatSlider, 600, 26);
+  lv_obj_set_pos(beatSlider, 12, 192);
+  lv_slider_set_range(beatSlider, 400, 3000); // 4.00..30.00
+  lv_slider_set_value(beatSlider, (int32_t)lrintf(beatHz * 100.0f), LV_ANIM_OFF);
+  lv_obj_add_event_cb(beatSlider, beat_slider_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  beatValueLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(beatValueLabel, &style_text_large, 0);
+  lv_obj_set_style_text_color(beatValueLabel, lv_color_hex(0xFFFF00), 0);
+  lv_obj_set_pos(beatValueLabel, 620, 188);
+
+  // Duration spinbox + +/- (bigger)
+  lv_obj_t* durLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(durLabel, &style_text_large, 0);
+  lv_label_set_text(durLabel, "Duration (min):");
+  lv_obj_set_pos(durLabel, 12, 232);
+
+  minutesSB = lv_spinbox_create(lv_screen_active());
+  lv_spinbox_set_range(minutesSB, 1, 60);
+  lv_spinbox_set_value(minutesSB, sessionMinutes);
+  lv_spinbox_set_rollover(minutesSB, false);
+  lv_obj_set_size(minutesSB, 100, 48);
+  lv_obj_set_pos(minutesSB, 12, 268);
+  lv_obj_add_style(minutesSB, &style_text_large, 0);
+
+  minutesMinusBtn = make_btn(lv_screen_active(), "−", minutes_minus_event_cb, nullptr, 48, 48);
+  lv_obj_set_pos(minutesMinusBtn, 120, 268);
+
+  minutesPlusBtn = make_btn(lv_screen_active(), "+", minutes_plus_event_cb, nullptr, 48, 48);
+  lv_obj_set_pos(minutesPlusBtn, 172, 268);
+
+  // Session control buttons (big)
+  startBtn = make_btn(lv_screen_active(), "Start", start_btn_event_cb, nullptr, 150, 50);
+  pauseBtn = make_btn(lv_screen_active(), "Pause/Resume", pause_btn_event_cb, nullptr, 190, 50);
+  stopBtn  = make_btn(lv_screen_active(), "Stop",  stop_btn_event_cb,  nullptr, 150, 50);
+
+  lv_obj_set_pos(startBtn,  250, 264);
+  lv_obj_set_pos(pauseBtn,  410, 264);
+  lv_obj_set_pos(stopBtn,   610, 264);
+
+  // Time / Progress (big)
+  timeLeftLabel = lv_label_create(lv_screen_active());
+  lv_obj_add_style(timeLeftLabel, &style_text_large, 0);
+  lv_obj_set_pos(timeLeftLabel, 12, 326);
+
+  progressBar = lv_bar_create(lv_screen_active());
+  lv_obj_set_size(progressBar, 776, 24);
+  lv_obj_set_pos(progressBar, 12, 360);
+
+  // Initial fill
+  ui_sync_all();
 }
 
-void computeEngine()
-{
-  const Preset& p = PRESETS[presetIdx];
-  if (beatHz < p.beatMin) beatHz = p.beatMin;
-  if (beatHz > p.beatMax) beatHz = p.beatMax;
-
-  fLeft  = baseHz - (beatHz * 0.5f);
-  fRight = baseHz + (beatHz * 0.5f);
+/* ------------------------------- Serial ------------------------------- */
+static void applyPreset(int idx) {
+  presetIdx = idx; baseHz = PRESETS[idx].baseHz; beatHz = PRESETS[idx].beatHz; ui_sync_all();
 }
-
-void applyPreset(int idx)
-{
-  presetIdx = idx;
-  baseHz = PRESETS[idx].baseHz;
-  beatHz = PRESETS[idx].beatHz;
-
-  // reflect to audio engine
-  audio.setBaseHz(baseHz);
-  audio.setBeatHz(beatHz);
-}
-
-void startSession()
-{
-  if (state == SessionState::RUNNING) return;
-  if (state == SessionState::DONE) { accumulatedMs = 0; }
-  state = SessionState::RUNNING;
-  sessionStartMs = millis();
-  lastSecondTick = 0; // force immediate countdown refresh
-
-  audio.start();
-}
-
-void pauseSessionToggle()
-{
-  if (state == SessionState::RUNNING) {
-    // accumulate time up to now
-    accumulatedMs += (millis() - sessionStartMs);
-    state = SessionState::PAUSED;
-    audio.pause();
-  } else if (state == SessionState::PAUSED) {
-    // resume
-    sessionStartMs = millis();
-    state = SessionState::RUNNING;
-    audio.start(); // resume audio
-  }
-}
-
-void stopSession()
-{
-  state = SessionState::IDLE;
-  accumulatedMs = 0;
-  lastSecondTick = 0;
-  audio.stop();
-}
-
-uint32_t sessionElapsedMs()
-{
-  if (state == SessionState::RUNNING) {
-    return accumulatedMs + (millis() - sessionStartMs);
-  }
-  return accumulatedMs;
-}
-
-uint32_t sessionTotalMs()
-{
-  return (uint32_t)sessionMinutes * 60u * 1000u;
-}
-
-// ==================== Input ====================
-void handleSerial()
-{
+static void handleSerial() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     switch (c) {
-      // presets
       case '1': applyPreset(0); break;
       case '2': applyPreset(1); break;
       case '3': applyPreset(2); break;
       case '4': applyPreset(3); break;
-
-      // base / beat
-      case 'q': baseHz += 5.0f; audio.setBaseHz(baseHz); break;
-      case 'a': baseHz -= 5.0f; if (baseHz < 20.0f) baseHz = 20.0f; audio.setBaseHz(baseHz); break;
-      case 'w': beatHz += 0.5f; audio.setBeatHz(beatHz); break;
-      case 's': beatHz -= 0.5f; audio.setBeatHz(beatHz); break;
-      case 'r': baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz;
-                audio.setBaseHz(baseHz); audio.setBeatHz(beatHz); break;
-
-      // session controls
-      case 'g': startSession(); break;     // go
+      case 'q': baseHz += 5.0f; break;
+      case 'a': baseHz -= 5.0f; if (baseHz<20.0f) baseHz=20.0f; break;
+      case 'w': beatHz += 0.5f; break;
+      case 's': beatHz -= 0.5f; break;
+      case 'r': baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz; break;
+      case 'g': startSession(); break;
       case 'p': pauseSessionToggle(); break;
       case 'x': stopSession(); break;
-
-      // duration
-      case '+': if (sessionMinutes < 60) sessionMinutes++; break;
-      case '-': if (sessionMinutes > 1)  sessionMinutes--; break;
-
-      // UI refresh (safety)
-      case 'z': // Redraw everything if anything ever looks off
-        gfx->fillScreen(BLACK);
-        // reset caches so everything repaints cleanly
-        lastBase = NAN; lastBeat = NAN; lastLeft = NAN; lastRight = NAN;
-        lastPreset = -1; lastPausedFlag = !lastPausedFlag;
-        lastVizX = -1;
-        lastStateDrawn = SessionState::DONE; // force different
-        lastMinutesDrawn = 255;
-        lastRemainSecDrawn = UINT32_MAX;
-        lastProgress = -1.0f;
-        drawStaticOnce();
-        break;
-
-      // serial convenience
-      case 'h': print_banner(); break;          // re-print controls + mem header
-      case 'm': print_mem("NOW"); break;        // dump current memory
-
-      default: break;
+      case '+': if (sessionMinutes<60) sessionMinutes++; break;
+      case '-': if (sessionMinutes>1)  sessionMinutes--; break;
+      case 'h': print_banner(); break;
+      case 'm': print_mem("NOW"); break;
+      case 'z': default: break;
     }
+    ui_sync_all();
   }
 }
 
-// ==================== Drawing (dirty-region updates) ====================
-void drawStaticOnce()
-{
-  // Header bar background
-  gfx->fillRect(0, 0, 800, 42, 0x0841);
+/* ------------------------ Timers / Lifecycle -------------------------- */
+static void session_timer_cb(lv_timer_t*) { ui_update_progress(); }
 
-  // Main panel background
-  gfx->fillRect(0, 42, 800, 438, BLACK);
-
-  // Left / Right boxes and labels
-  gfx->fillRect(40, 80, 320, 140, 0x39E7);
-  gfx->fillRect(440, 80, 320, 140, 0x39E7);
-  gfx->drawRect(40, 80, 320, 140, WHITE);
-  gfx->drawRect(440, 80, 320, 140, WHITE);
-
-  gfx->setTextColor(WHITE); gfx->setTextSize(2);
-  gfx->setCursor(60, 100); gfx->print("Left Freq (Hz)");
-  gfx->setCursor(460, 100); gfx->print("Right Freq (Hz)");
-
-  // Visualizer baseline
-  gfx->fillRect(40, 340, 720, 12, 0x10A2);
-
-  // Footer area for info + controls
-  gfx->fillRect(40, 260, 720, 90, BLACK);
-
-  // Progress bar track (bottom band)
-  gfx->fillRect(40, 400, 720, 24, 0x2104); // dark track
-  gfx->drawRect(40, 400, 720, 24, WHITE);  // outline
-}
-
-const char* stateName(SessionState s)
-{
-  switch (s) {
-    case SessionState::IDLE:   return "IDLE";
-    case SessionState::RUNNING:return "RUNNING";
-    case SessionState::PAUSED: return "PAUSED";
-    case SessionState::DONE:   return "DONE";
-  }
-  return "";
-}
-
-void drawHeaderIfChanged()
-{
-  bool pausedFlag = (state == SessionState::PAUSED);
-  if (lastPreset!=presetIdx || lastBase!=baseHz || lastBeat!=beatHz || lastPausedFlag!=pausedFlag) {
-    gfx->fillRect(0, 0, 800, 42, 0x0841);
-    gfx->setTextColor(WHITE);
-    gfx->setTextSize(2);
-    gfx->setCursor(12, 12);
-    gfx->printf("Preset: %s   Base: %.1f Hz   Beat: %.2f Hz   %s",
-                PRESETS[presetIdx].name, baseHz, beatHz, pausedFlag ? "[PAUSED]" : " ");
-    lastPreset = presetIdx; lastPausedFlag = pausedFlag;
-  }
-}
-
-void drawFreqsIfChanged()
-{
-  if (lastLeft!=fLeft) {
-    gfx->fillRect(60, 145, 260, 40, 0x39E7);
-    gfx->setTextColor(WHITE); gfx->setTextSize(3); gfx->setCursor(60, 150);
-    gfx->printf("%.2f", fLeft);
-    lastLeft = fLeft;
-  }
-  if (lastRight!=fRight) {
-    gfx->fillRect(460, 145, 260, 40, 0x39E7);
-    gfx->setTextColor(WHITE); gfx->setTextSize(3); gfx->setCursor(460, 150);
-    gfx->printf("%.2f", fRight);
-    lastRight = fRight;
-  }
-
-  if (lastBase!=baseHz || lastBeat!=beatHz) {
-    gfx->fillRect(40, 260, 720, 90, BLACK);
-    gfx->setTextColor(WHITE); gfx->setTextSize(2);
-    gfx->setCursor(40, 260); gfx->printf("Carrier/Base: %.2f Hz", baseHz);
-    gfx->setCursor(40, 290); gfx->printf("Beat Delta:   %.2f Hz  (L = base - beat/2, R = base + beat/2)", beatHz);
-    gfx->setCursor(40, 320); gfx->print("Serial: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
-    lastBase = baseHz; lastBeat = beatHz;
-  }
-}
-
-void drawSessionPanelIfChanged()
-{
-  // Recompute session metrics
-  uint32_t totalMs = sessionTotalMs();
-  uint32_t elapsed = sessionElapsedMs();
-  if (elapsed >= totalMs && (state == SessionState::RUNNING)) {
-    state = SessionState::DONE;
-  }
-  uint32_t remainMs = (elapsed >= totalMs) ? 0 : (totalMs - elapsed);
-  uint32_t remainSec = remainMs / 1000;
-  float progress = (totalMs == 0) ? 0.f : (float)elapsed / (float)totalMs;
-  if (progress > 1.0f) progress = 1.0f;
-
-  // Redraw only when needed
-  bool needStateLine = (state != lastStateDrawn) || (sessionMinutes != lastMinutesDrawn);
-  bool needCountdown = (remainSec != lastRemainSecDrawn) || needStateLine;
-  bool needProgress  = fabsf(progress - lastProgress) > 0.005f || needStateLine;
-
-  if (needStateLine) {
-    // Upper footer line: state + minutes
-    gfx->fillRect(40, 260, 720, 28, BLACK);
-    gfx->setTextColor(WHITE); gfx->setTextSize(2);
-    gfx->setCursor(40, 260);
-    gfx->printf("Session: %s   Duration: %u min", stateName(state), (unsigned)sessionMinutes);
-    lastStateDrawn = state;
-    lastMinutesDrawn = sessionMinutes;
-  }
-
-  if (needCountdown) {
-    // Middle footer line: remaining mm:ss
-    uint32_t mm = remainSec / 60;
-    uint32_t ss = remainSec % 60;
-    gfx->fillRect(40, 288, 720, 28, BLACK);
-    gfx->setTextColor(WHITE); gfx->setTextSize(2);
-    gfx->setCursor(40, 288);
-    gfx->printf("Time Left: %02u:%02u", (unsigned)mm, (unsigned)ss);
-    lastRemainSecDrawn = remainSec;
-  }
-
-  if (needProgress) {
-    // Progress bar fill
-    int trackX = 40, trackY = 400, trackW = 720, trackH = 24;
-    int fillW = (int)(progress * (float)(trackW - 2)); // inside border
-    // clear interior
-    gfx->fillRect(trackX+1, trackY+1, trackW-2, trackH-2, 0x2104);
-    // draw fill
-    if (fillW > 0) {
-      gfx->fillRect(trackX+1, trackY+1, fillW, trackH-2, 0x07E0 /* green-ish */);
-    }
-    // border stays
-    gfx->drawRect(trackX, trackY, trackW, trackH, WHITE);
-    lastProgress = progress;
-  }
-}
-
-// ==================== Arduino lifecycle ====================
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  delay(150);            // small settle so early prints are not missed
-  print_banner();        // print on demand later with 'h'
+  delay(150);
+  print_banner();
 
-  // PSRAM check
-  if (ESP.getPsramSize() < 4 * 1024 * 1024) {
-    Serial.println("[ERR] PSRAM not detected or too small. Check board/flags.");
-    for (;;) delay(1000);
-  }
+  if (ESP.getPsramSize() < 4*1024*1024) { Serial.println("[ERR] PSRAM missing."); for(;;) delay(1000); }
 
-  // Backlight on (via CH422G)
   backlight_on();
+  if (!gfx->begin()) { Serial.println("[ERR] gfx->begin() failed"); for(;;) delay(1000); }
 
-  // Display init
-  if (!gfx->begin()) {
-    Serial.println("[ERR] gfx->begin() failed");
-    for (;;) delay(1000);
-  }
+  lv_init();
 
-  // AudioEngine init (no audio yet; prepares for I2S later)
-  audio.begin();
-  audio.setBaseHz(baseHz);
-  audio.setBeatHz(beatHz);
+  size_t buf_pixels = 800 * LV_BUF_LINES;
+  lv_buf1 = (lv_color_t*) heap_caps_malloc(buf_pixels*sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+  lv_buf2 = (lv_color_t*) heap_caps_malloc(buf_pixels*sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+  if (!lv_buf1 || !lv_buf2) { Serial.println("[ERR] LVGL buffer alloc failed"); for(;;) delay(1000); }
+
+  lv_display_t* display = lv_display_create(800, 480);
+  lv_display_set_flush_cb(display, lvgl_flush_cb);
+  lv_display_set_buffers(display, lv_buf1, lv_buf2, buf_pixels*sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_PARTIAL);
+  disp = display;
+
+  const esp_timer_create_args_t tick_args = { .callback=&lvgl_tick_cb, .arg=nullptr, .dispatch_method=ESP_TIMER_TASK, .name="lv_tick" };
+  esp_timer_handle_t tick_timer; esp_timer_create(&tick_args, &tick_timer); esp_timer_start_periodic(tick_timer, 5000);
+
+  computeEngine();
+  build_ui();
+
+  lv_timer_create(session_timer_cb, 250, nullptr);
 
   print_mem("POST-begin");
-
-  // Initial state
-  applyPreset(0);
-  computeEngine();
-
-  // Draw static layout once
-  gfx->fillScreen(BLACK);
-  drawStaticOnce();
-
-  // Draw first frame
-  drawHeaderIfChanged();
-  drawFreqsIfChanged();
-  drawSessionPanelIfChanged();
-
-  // Push the composed frame
-  gfx->flush();
-
-  Serial.println("[OK] Controls: 1..4 presets | q/a base +/-5 | w/s beat +/-0.5 | r reset | g start | p pause/resume | x stop | +/- minutes | z redraw | h help | m mem");
+  Serial.println("[OK] UI up with large fonts.");
 }
 
-void loop()
-{
+void loop() {
   handleSerial();
-
-  // Engine + UI updates regardless of session, but animated parts only when not paused/done
-  computeEngine();
-
-  // reflect current values to AudioEngine (cheap; it coalesces updates)
-  audio.setBaseHz(baseHz);
-  audio.setBeatHz(beatHz);
-  audio.update();
-
-  // Header / numeric readouts update if changed
-  drawHeaderIfChanged();
-  drawFreqsIfChanged();
-
-  // Session UI: update countdown ~4 Hz for responsiveness without heavy repaint
-  uint32_t now = millis();
-  if (now - lastSecondTick >= 250) {
-    lastSecondTick = now;
-    drawSessionPanelIfChanged();
-  }
-
-  // Visualizer animates in RUNNING or IDLE; pauses in PAUSED and shows full when DONE
-  if (state != SessionState::PAUSED) {
-    static uint32_t t0 = millis();
-    float t = (millis() - t0) / 1000.0f;
-    // same thin bar logic as before
-    float speed = beatHz; if (speed < 0.5f) speed = 0.5f; if (speed > 30.0f) speed = 30.0f;
-    speed /= 30.0f;
-    int x = 40 + (int)(sin(t * speed * 2.0f * PI) * 200.0f + 200.0f);
-    if (lastVizX >= 0) gfx->fillRect(40, 340, lastVizX, 12, 0x10A2);
-    gfx->fillRect(40, 340, x, 12, 0xFBE0);
-    lastVizX = x;
-  }
-
-  // Heartbeat pixel (top-left)
-  static bool hb = false;
-  gfx->drawPixel(0, 0, hb ? GREEN : RED);
-  hb = !hb;
-
-  // If session completed, mark DONE once and freeze visuals (except heartbeat)
-  if (state == SessionState::RUNNING && sessionElapsedMs() >= sessionTotalMs()) {
-    state = SessionState::DONE;
-    audio.stop();
-  }
-
-  // Push the frame once per loop
-  gfx->flush();
-
-  // ~60 FPS pacing if PCLK allows; otherwise still smooth due to single flush + dirty regions
-  delay(16);
+  lv_timer_handler();
+  delay(2);
 }
