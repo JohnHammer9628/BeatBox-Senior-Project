@@ -1,11 +1,10 @@
 // src/main.cpp
 /**
- * WS43B (ESP32-S3 + CH422G + GT911) — LVGL UI + safer GT911 reset
- * - Only EXIO2 is forced HIGH (backlight); others left INPUT (high-Z)
- * - Try GT911 reset via EXIO6/7 (both A/B mappings)
- * - After reset: INT -> INPUT (release), RST -> OUTPUT HIGH (hold)
- * - Touch driver is in touch_input.cpp (auto-detect + raw GT reader)
- * - Adds periodic GT status log for quick debugging
+ * WS43B (ESP32-S3 + CH422G + GT911) — LVGL UI polish + clean slider edges
+ * - Keeps your last good iteration (BL after first frame, boosted RGB drive, no GT HUD)
+ * - Knob always on-screen WITHOUT padding (no left-edge color sliver)
+ *   → we shrink and offset the slider track instead of using pad_left/right
+ * - During drag we still avoid writing slider value/range (prevents snap-back)
  */
 
 #include <Arduino.h>
@@ -21,7 +20,7 @@ using namespace esp_expander;
 #include <display/Arduino_RGB_Display.h>
 
 #include <lvgl.h>
-#include "touch_input.h"   // your auto-detect + raw GT reader
+#include "touch_input.h"
 
 /* ------------------------- Pins / I2C ------------------------- */
 static constexpr int I2C_SDA  = 8;
@@ -31,6 +30,15 @@ static constexpr int I2C_SCL  = 9;
 static constexpr int I2C_PORT = 0;
 static CH422G *exio = nullptr;
 static constexpr int EXIO_BL = 2;   // backlight rail
+
+/* -------------------- (Optional) drive strength --------------- */
+#include "driver/gpio.h"
+static inline void boost_rgb_drive() {
+  gpio_set_drive_capability((gpio_num_t)5,  GPIO_DRIVE_CAP_3); // DE
+  gpio_set_drive_capability((gpio_num_t)3,  GPIO_DRIVE_CAP_3); // VS
+  gpio_set_drive_capability((gpio_num_t)46, GPIO_DRIVE_CAP_3); // HS
+  gpio_set_drive_capability((gpio_num_t)7,  GPIO_DRIVE_CAP_3); // PCLK
+}
 
 /* ------------------------ Display HW -------------------------- */
 Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
@@ -80,8 +88,8 @@ static lv_obj_t*  timeLeftLabel;
 static lv_obj_t*  progressBar;
 
 /* --- On-screen diagnostics --- */
-static lv_obj_t* diagLabel = nullptr;     // general status (touch, etc.)
-static lv_obj_t* scanBox = nullptr;       // multi-line I2C scan box
+static lv_obj_t* diagLabel = nullptr;
+static lv_obj_t* scanBox = nullptr;
 static void diag_set(const char* s) { if (diagLabel) lv_label_set_text(diagLabel, s); }
 static void scan_set(const char* s) { if (scanBox) lv_label_set_text(scanBox, s); }
 static void i2c_scan_multiline(const char* tag);
@@ -92,10 +100,11 @@ static lv_color_t* lv_buf1 = nullptr;
 static lv_color_t* lv_buf2 = nullptr;
 
 /* ----------------------------- Utilities ------------------------------ */
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
 static inline void computeEngine() {
   const Preset& p = PRESETS[presetIdx];
-  if (beatHz < p.beatMin) beatHz = p.beatMin;
-  if (beatHz > p.beatMax) beatHz = p.beatMax;
+  beatHz = clampf(beatHz, p.beatMin, p.beatMax);
   fLeft  = baseHz - (beatHz * 0.5f);
   fRight = baseHz + (beatHz * 0.5f);
 }
@@ -132,13 +141,24 @@ static void init_styles() {
   lv_style_set_radius(&style_btn, 10);
   lv_style_set_pad_all(&style_btn, 8);
 
-  // Scan box style (yellow text)
   lv_style_init(&style_scan);
   lv_style_set_text_color(&style_scan, lv_color_hex(0xFFFF00));
   lv_style_set_text_font(&style_scan, &lv_font_montserrat_20);
 }
 
-/* ---------------------------- LVGL UI bits ---------------------------- */
+/* ---------------------- Slider helpers (preset-aware) ------------------ */
+static bool s_dragging_slider = false;   // track active drag
+
+static void slider_apply_preset_range_once() {
+  // Only used on preset change / initial build. Not during drag.
+  const Preset& p = PRESETS[presetIdx];
+  const int32_t min100 = (int32_t)lrintf(p.beatMin * 100.0f);
+  const int32_t max100 = (int32_t)lrintf(p.beatMax * 100.0f);
+  lv_slider_set_range(beatSlider, min100, max100);
+  int32_t v = (int32_t)lrintf(clampf(beatHz, p.beatMin, p.beatMax) * 100.0f);
+  lv_slider_set_value(beatSlider, v, LV_ANIM_OFF);
+}
+
 static void ui_update_header() {
   char hdr[128];
   snprintf(hdr, sizeof(hdr), "Preset: %s   Base: %.1f Hz   Beat: %.2f Hz",
@@ -152,6 +172,15 @@ static void ui_update_lr() {
 }
 static void ui_update_slider() {
   if (!beatSlider) return;
+  if (s_dragging_slider) {
+    char bv[32]; snprintf(bv, sizeof(bv), "%.2f Hz", beatHz);
+    lv_label_set_text(beatValueLabel, bv);
+    return;
+  }
+  const Preset& p = PRESETS[presetIdx];
+  const int32_t min100 = (int32_t)lrintf(p.beatMin * 100.0f);
+  const int32_t max100 = (int32_t)lrintf(p.beatMax * 100.0f);
+  lv_slider_set_range(beatSlider, min100, max100);
   lv_slider_set_value(beatSlider, (int32_t)lrintf(beatHz * 100.0f), LV_ANIM_OFF);
   char bv[32]; snprintf(bv, sizeof(bv), "%.2f Hz", beatHz);
   lv_label_set_text(beatValueLabel, bv);
@@ -176,25 +205,57 @@ static void ui_update_progress() {
            sname, (unsigned)sessionMinutes, (unsigned)mm, (unsigned)ss);
   lv_label_set_text(timeLeftLabel, tl);
 }
-static void ui_sync_all() { computeEngine(); ui_update_header(); ui_update_lr(); ui_update_slider(); ui_update_minutes(); ui_update_progress(); }
+static void ui_sync_all(bool light=false) {
+  computeEngine();
+  if (!light) ui_update_header();
+  ui_update_lr();
+  ui_update_slider();
+  ui_update_minutes();
+  ui_update_progress();
+}
 
 /* ------------------------------ Events ------------------------------- */
 static void beat_slider_event_cb(lv_event_t* e) {
-  int32_t v = lv_slider_get_value((lv_obj_t*)lv_event_get_target(e));
-  beatHz = v / 100.0f; ui_sync_all();
+  lv_event_code_t code = lv_event_get_code(e);
+  lv_obj_t* target = (lv_obj_t*)lv_event_get_target(e);
+
+  if (code == LV_EVENT_PRESSED) {
+    s_dragging_slider = true;
+    return;
+  }
+  if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    int32_t v = lv_slider_get_value(target);
+    beatHz = v / 100.0f;
+    s_dragging_slider = false;
+    ui_sync_all(false);
+    return;
+  }
+  if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_PRESSING) {
+    int32_t v = lv_slider_get_value(target);
+    beatHz = v / 100.0f;
+    ui_sync_all(true);
+  }
 }
+
 static void preset_btn_event_cb(lv_event_t* e) {
   uintptr_t idx = (uintptr_t) lv_event_get_user_data(e);
-  presetIdx = (int)idx; baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz; ui_sync_all();
+  presetIdx = (int)idx;
+  const Preset& p = PRESETS[presetIdx];
+  baseHz = p.baseHz;
+  beatHz = clampf(p.beatHz, p.beatMin, p.beatMax);
+  slider_apply_preset_range_once();
+  ui_sync_all(false);
 }
+
 static void startSession(){ if (state!=SessionState::RUNNING){ if(state==SessionState::DONE) accumulatedMs=0; state=SessionState::RUNNING; sessionStartMs=millis(); } }
 static void pauseSessionToggle(){ if(state==SessionState::RUNNING){ accumulatedMs+= (millis()-sessionStartMs); state=SessionState::PAUSED; } else if(state==SessionState::PAUSED){ sessionStartMs=millis(); state=SessionState::RUNNING; } }
 static void stopSession(){ state=SessionState::IDLE; accumulatedMs=0; }
+
 static void start_btn_event_cb(lv_event_t*) { startSession(); ui_update_progress(); }
 static void pause_btn_event_cb(lv_event_t*) { pauseSessionToggle(); ui_update_progress(); }
 static void stop_btn_event_cb (lv_event_t*) { stopSession(); ui_update_progress(); }
 static void minutes_minus_event_cb(lv_event_t*) { if (sessionMinutes>1)  sessionMinutes--; ui_update_minutes(); ui_update_progress(); }
-static void minutes_plus_event_cb (lv_event_t*) { if (sessionMinutes<60) sessionMinutes++; ui_update_minutes(); ui_update_progress(); }
+static void minutes_plus_event_cb(lv_event_t*) { if (sessionMinutes<60) sessionMinutes++; ui_update_minutes(); ui_update_progress(); }
 
 /* ------------------------------ Build UI ------------------------------ */
 static lv_obj_t* make_btn(lv_obj_t* parent, const char* txt, lv_event_cb_t cb, void* ud=nullptr, int w=120, int h=44) {
@@ -231,12 +292,29 @@ static void build_ui() {
   lv_label_set_text(beatLabel, "Beat (Hz):");
   lv_obj_set_pos(beatLabel, 12, 158);
 
+  // --- Clean slider: shrink and offset so knob stays inside without padding ---
+  const int KNOB = 28;                          // knob diameter (px)
+  const int TRACK_W = 600;                      // original intended width
+  const int TRACK_X = 12;                       // original X
+  const int MARGIN  = 2;                        // small visual margin
+
   beatSlider = lv_slider_create(lv_screen_active());
-  lv_obj_set_size(beatSlider, 600, 26);
-  lv_obj_set_pos(beatSlider, 12, 192);
-  lv_slider_set_range(beatSlider, 400, 3000); // 4.00..30.00
-  lv_slider_set_value(beatSlider, (int32_t)lrintf(beatHz * 100.0f), LV_ANIM_OFF);
-  lv_obj_add_event_cb(beatSlider, beat_slider_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_set_style_base_dir(beatSlider, LV_BASE_DIR_LTR, 0);      // left=min, right=max
+  lv_obj_set_style_width(beatSlider,  KNOB, LV_PART_KNOB);
+  lv_obj_set_style_height(beatSlider, KNOB, LV_PART_KNOB);
+
+  // Instead of padding, shorten the track by the knob width and center it
+  lv_obj_set_size(beatSlider, TRACK_W - (KNOB + 2*MARGIN), 26);
+  lv_obj_set_pos (beatSlider, TRACK_X + (KNOB/2 + MARGIN), 192);
+
+  {
+    const Preset& p = PRESETS[presetIdx];
+    lv_slider_set_range(beatSlider,
+      (int32_t)lrintf(p.beatMin * 100.0f),
+      (int32_t)lrintf(p.beatMax * 100.0f));
+    lv_slider_set_value(beatSlider, (int32_t)lrintf(p.beatHz * 100.0f), LV_ANIM_OFF);
+  }
+  lv_obj_add_event_cb(beatSlider, beat_slider_event_cb, LV_EVENT_ALL, nullptr);
 
   beatValueLabel = lv_label_create(lv_screen_active());
   lv_obj_add_style(beatValueLabel, &style_text_large, 0);
@@ -295,20 +373,32 @@ static void build_ui() {
 }
 
 /* ------------------------------- Serial ------------------------------- */
-static void applyPreset(int idx) { presetIdx = idx; baseHz = PRESETS[idx].baseHz; beatHz = PRESETS[idx].beatHz; ui_sync_all(); }
+static void applyPreset(int idx) {
+  presetIdx = idx;
+  const Preset& p = PRESETS[presetIdx];
+  baseHz = p.baseHz;
+  beatHz = clampf(p.beatHz, p.beatMin, p.beatMax);
+  slider_apply_preset_range_once();
+  ui_sync_all(false);
+}
 static void handleSerial() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     switch (c) {
       case '1': applyPreset(0); break; case '2': applyPreset(1); break;
       case '3': applyPreset(2); break; case '4': applyPreset(3); break;
-      case 'q': baseHz += 5.0f; break; case 'a': baseHz -= 5.0f; if (baseHz<20.0f) baseHz=20.0f; break;
-      case 'w': beatHz += 0.5f; break; case 's': beatHz -= 0.5f; break;
+      case 'q': baseHz += 5.0f; break;
+      case 'a': baseHz -= 5.0f; if (baseHz<20.0f) baseHz=20.0f; break;
+      case 'w': beatHz += 0.5f; break;
+      case 's': beatHz -= 0.5f; break;
       case 'r': baseHz = PRESETS[presetIdx].baseHz; beatHz = PRESETS[presetIdx].beatHz; break;
-      case '+': if (sessionMinutes<60) sessionMinutes++; break; case '-': if (sessionMinutes>1) sessionMinutes--; break;
+      case '+': if (sessionMinutes<60) sessionMinutes++; break;
+      case '-': if (sessionMinutes>1)  sessionMinutes--; break;
       default: break;
     }
-    ui_sync_all();
+    beatHz = clampf(beatHz, PRESETS[presetIdx].beatMin, PRESETS[presetIdx].beatMax);
+    if (!s_dragging_slider) slider_apply_preset_range_once();
+    ui_sync_all(false);
   }
 }
 
@@ -340,67 +430,36 @@ static void i2c_scan_multiline(const char* tag) {
 }
 
 /* ---------------------- GT911 reset via CH422G ------------------------ */
-/* Try two likely mappings:
- *   Mapping A: INT=EXIO7, RST=EXIO6
- *   Mapping B: INT=EXIO6, RST=EXIO7
- * After reset: INT->INPUT (release), RST->OUTPUT HIGH (hold)
- */
 static bool gt_reset_seq(int exio_int, int exio_rst) {
   if (!exio) return false;
-
-  // Prepare: make both outputs, default HIGH
   exio->pinMode(exio_int, OUTPUT);
   exio->pinMode(exio_rst, OUTPUT);
   exio->digitalWrite(exio_int, HIGH);
   exio->digitalWrite(exio_rst, HIGH);
   delay(2);
 
-  // 1) INT -> LOW
   exio->digitalWrite(exio_int, LOW);
   delay(1);
 
-  // 2) RST low -> high
   exio->digitalWrite(exio_rst, LOW);  delay(10);
   exio->digitalWrite(exio_rst, HIGH); delay(10);
 
-  // 3) Release INT (set to INPUT/high-Z), keep RST high
   exio->pinMode(exio_int, INPUT);
-  exio->digitalWrite(exio_rst, HIGH); // keep as output high
+  exio->digitalWrite(exio_rst, HIGH);
 
   delay(20);
 
-  // Probe
   Wire.beginTransmission(0x5D);
   bool ok = (Wire.endTransmission() == 0);
   Serial.printf("[*] GT911 reset via CH422G: INT=EXIO%d RST=EXIO%d -> %s\n",
                 exio_int, exio_rst, ok ? "0x5D ACK" : "NO ACK");
   return ok;
 }
-
 static bool try_gt_reset() {
-  // Mapping A
   if (gt_reset_seq(7, 6)) { Serial.println("[*] Mapping A OK (INT=EXIO7, RST=EXIO6)"); return true; }
-  // Mapping B
   if (gt_reset_seq(6, 7)) { Serial.println("[*] Mapping B OK (INT=EXIO6, RST=EXIO7)"); return true; }
   Serial.println("[*] No ACK after A/B reset (will continue anyway)");
   return false;
-}
-
-/* ------------------ GT status poll (debug HUD) ------------------------ */
-static void gt_status_timer_cb(lv_timer_t*) {
-  // Read GT911 status (0x814E) just for HUD; leaves real reading to touch_input.cpp
-  const uint8_t addr = 0x5D;
-  uint8_t reg[2] = { 0x81, 0x4E };
-  uint8_t status = 0x00;
-
-  Wire.beginTransmission(addr);
-  Wire.write(reg, 2);
-  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((int)addr, 1) == 1) {
-    status = Wire.read();
-    uint8_t n = status & 0x0F;
-    bool buf_ready = status & 0x80;
-    Serial.printf("GT HUD: status=0x%02X n=%u %s\n", status, n, buf_ready ? "[buf]" : "");
-  }
 }
 
 /* ------------------------ Timers / Lifecycle -------------------------- */
@@ -424,24 +483,20 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);
   delay(3);
-  (void)i2c_bus_recover(); // from touch_input.cpp (safe)
+  (void)i2c_bus_recover(); // safe
 
-  // --- CH422G: only BL high, others INPUT (do NOT force all high) ---
+  // --- CH422G: keep BL OFF initially, others INPUT ---
   exio = new CH422G(I2C_PORT, I2C_SDA, I2C_SCL);
   if (exio->begin()) {
-    // Backlight rail ON
     exio->pinMode(EXIO_BL, OUTPUT);
-    exio->digitalWrite(EXIO_BL, HIGH);
-    Serial.println("[exio] EXIO2 -> HIGH (BL rail)");
-
-    // Leave other pins high-Z unless we actively use them
+    exio->digitalWrite(EXIO_BL, LOW);     // BL OFF until first clean frame
+    Serial.println("[exio] EXIO2 -> LOW (BL off)");
     for (int pin = 0; pin < 8; ++pin) {
       if (pin == EXIO_BL) continue;
       exio->pinMode(pin, INPUT);
     }
     Serial.println("[exio] EXIO[others] -> INPUT (released)");
 
-    // Try GT reset via EXIO pairs
     try_gt_reset();
   } else {
     Serial.println("[exio] CH422G begin() failed");
@@ -452,6 +507,7 @@ void setup() {
   Wire.setClock(400000);
 
   // --- Display + LVGL ---
+  boost_rgb_drive();
   if (!gfx->begin()) { Serial.println("[fatal] gfx->begin() failed"); for(;;) delay(1000); }
 
   lv_init();
@@ -474,17 +530,20 @@ void setup() {
   const esp_timer_create_args_t tick_args = { .callback=+[](void*){ lv_tick_inc(5); }, .arg=nullptr, .dispatch_method=ESP_TIMER_TASK, .name="lv_tick" };
   esp_timer_handle_t tick_timer; esp_timer_create(&tick_args, &tick_timer); esp_timer_start_periodic(tick_timer, 5000);
 
-  // Build UI first so diagnostics are visible
   build_ui();
 
-  // Immediate first refresh
+  // Render a clean frame, then enable BL after a short delay
+  gfx->fillScreen(BLACK);
   lv_timer_handler();
   lv_refr_now(NULL);
+  delay(150);
+  exio->digitalWrite(EXIO_BL, HIGH);
+  Serial.println("[exio] EXIO2 -> HIGH (BL on)");
 
   // Scan & show on-screen
   i2c_scan_multiline("post-BL");
 
-  // --- Touch auto-detect (from touch_input.cpp) ---
+  // --- Touch auto-detect ---
   touch_init_and_register_lvgl();
   if (touch_present()) {
     char buf[64];
@@ -502,16 +561,12 @@ void setup() {
   // Session updates
   lv_timer_create(session_timer_cb, 250, nullptr);
 
-  // GT status HUD (every 250 ms)
-  lv_timer_create(gt_status_timer_cb, 250, nullptr);
-
   print_mem("POST-begin");
 }
 
 /* -------------------------------- loop --------------------------------- */
 void loop() {
-  // UI interaction; touch_input.cpp provides LVGL pointer reads
-  // Serial controls work (1..4 presets, q/a base, w/s beat, +/- minutes)
   lv_timer_handler();
+  handleSerial();
   delay(2);
 }

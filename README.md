@@ -1,190 +1,84 @@
-# ESP32-S3 + Waveshare 4.3" RGB (800×480) — Dev Board **B**
+﻿# ESP32-S3 4.3" RGB + GT911 (I2C)  UI Bring-Up
 
-A one‑page reference for wiring, timing, PlatformIO config, libraries, controls, and recovery steps. Use this to get back to a known‑good state fast.
+**Last updated:** Oct 22, 2025
 
----
+**Board:** ESP32-S3 DevKitM-1 | **Display:** 800x480 RGB (parallel) | **Touch:** GT911 (I2C) | **Expander:** CH422G (I2C)  
+**UI:** LVGL v9 | **Framework:** Arduino (PlatformIO)
 
-## 1) Hardware at a Glance
+## Overview
 
-* **MCU:** ESP32‑S3 module on Waveshare 4.3" RGB LCD Dev Board **B**
-* **Display:** 4.3" RGB TTL panel, **800×480**, driven by ESP32 parallel RGB
-* **Backlight/IO:** CH422G I²C IO expander controls **Backlight Enable**
-* **PSRAM/Flash (board default):** 16 MB flash + OPI PSRAM (Octal‑PSRAM)
-* **Power:** USB‑C is OK for bring‑up; use a stable 5 V rail if adding power‑hungry peripherals or pushing PCLK toward ~32 MHz
+This project drives a Waveshare-style 4.3" 800x480 RGB TFT from an ESP32-S3, renders a simple LVGL UI, and reads capacitive touch via a GT911 controller on I2C. An on-board CH422G I/O expander shares the I2C bus and is used to manage rails (notably the backlight).
 
-> ⚠️ Note: ESP32‑S3 has **BLE only**. Consumer wireless headphones (A2DP) need **Bluetooth Classic**. For audio later, use: (a) an external BT audio transmitter, (b) an original ESP32 (Classic) as A2DP source, or (c) wired/I²S DAC during development.
+### Key Features
 
----
+- Stable UI rendering with LVGL partial mode & PSRAM buffers
+- GT911 touch working over I2C with auto-detect (FT6x36 probed/ignored if IDs do not match)
+- Backlight sequencing: BL is held OFF until first clean frame is rendered, then turned ON (reduces shimmer at boot)
+- Slider UX fixes: The Beat (Hz) slider knob always remains fully on-screen for all presets and ranges
 
-## 2) Wiring / Pinout (Dev Board B → ESP32‑S3 GPIO)
+## Hardware
 
-### I²C (CH422G Backlight Expander)
+### Components
+- **MCU:** ESP32-S3 DevKitM-1
+- **Display:** 800x480 RGB TFT, parallel Arduino_ESP32RGBPanel
+- **Touch:** GT911 (I2C @ 0x5D or 0x14 depending on reset strap)
+- **I/O Expander:** CH422G (addresses 0x20-0x27 and 0x30-0x3F visible)
 
-* **SDA** → GPIO **8**
-* **SCL** → GPIO **9**
-* **Port/Bus**: I2C **0**
-* **Backlight Enable**: CH422G **EXIO2** (exposed via library). We set this **HIGH** to turn BL on.
+### I2C Configuration
+- **SDA:** GPIO 8
+- **SCL:** GPIO 9
+- **Speed:** start @ 100 kHz for bring-up, then bump to 400 kHz
+- **BL Control:** CH422G EXIO2 (held LOW until first clean frame, then HIGH)
 
-### RGB Data/Timing Lines
+## Software Stack
 
-| Signal Group | Function             | GPIOs                     |
-| ------------ | -------------------- | ------------------------- |
-| Timing       | **DE, VS, HS, PCLK** | **5, 3, 46, 7**           |
-| Red          | **R0..R4**           | **1, 2, 42, 41, 40**      |
-| Green        | **G0..G5**           | **39, 0, 45, 48, 47, 21** |
-| Blue         | **B0..B4**           | **14, 38, 18, 17, 10**    |
+### Core Components
+- **Framework:** Arduino (ESP32 core) via PlatformIO
+- **Graphics:** LVGL v9.4.0
+- **Display driver:** Arduino_GFX (Arduino_ESP32RGBPanel + Arduino_RGB_Display)
 
-### Sync/TIMING Polarity & Blanking
+### Drivers
+- **Touch:** touch_input.cpp
+  - Auto-detect FT6x36 @ 0x38 (ignored if IDs look wrong)
+  - GT911 @ 0x5D or 0x14 (raw minimal driver used if GT911 lib absent)
+- **I/O expander:** ESP32_IO_Expander (CH422G)
 
-* **hsync_pol = 0**, **vsync_pol = 0**
-* Horizontal: **hfp=40, hsync=48, hbp=88** → **hTotal = 800 + 40 + 48 + 88 = 976**
-* Vertical: **vfp=13, vsync=3, vbp=32** → **vTotal = 480 + 13 + 3 + 32 = 528**
-* **pclk_neg = 1** (sample on falling edge)
+## Current Status
 
-### Pixel Clock (PCLK) Guidance
+### What Works
+- **Display init and LVGL UI:** header, preset buttons (Alpha/Beta/Theta/Delta), slider, timer widgets
+- **I2C shared bus:** CH422G + GT911 + panel EEPROM @ 0x51 often present
+- **Touch:** GT911 reads are valid, LVGL pointer device registered
+- **Backlight sequencing:** BL turns on after first frame - reduces initial shimmer
+- **Slider improvements:**
+  - Knob always fully visible and usable across all presets/ranges
+  - No value fighting during drag - prevents "snap back to start"
 
-* **16 MHz** → ~**31.05 Hz** refresh (`16e6 / (976 * 528)`), rock‑solid for bring‑up
-* **30–33 MHz** → ~**58–64 Hz** (closer to a 60 Hz feel). If you see tearing/flicker at high PCLK:
+### Known Issues & Observations
 
-  * Keep ribbon/jumpers short
-  * Ensure PSRAM is stable and powered
-  * Try 30–31 MHz before 32–33 MHz
+#### 1. Occasional Screen Shake/Jitter
+- Still appears intermittently, especially while touching/dragging
+- Likely causes: RGB timing, cable/grounding, and redraw pressure
+- Mitigations:
+  - Reduced I2C chatter (disabled GT HUD)
+  - Kept UI updates light during drag
+  - Next focus: further display timing tuning
 
----
+#### 2. Slider Release "Snap-back" (rare)
+- Main culprit (bidirectional write during drag) mitigated
+- Remaining jumps likely due to:
+  - LVGL clamping to range
+  - Final compute/rounding tick
+- Plan: Tighten end-of-drag path next
 
-## 3) PlatformIO (Known‑Good)
+#### 3. Orientation/Coordinate Sanity
+- Some panels report quirky GT911 config values
+- Orientation flags are compile-time toggles in platformio.ini
 
-```ini
-[env:ws43b]
-platform = espressif32@6.12.0
-board = esp32-s3-devkitm-1
-framework = arduino
-monitor_speed = 115200
+## UX & Math (Binaural Beat Mapping)
 
-; USB CDC for Serial
-build_unflags = -std=gnu++11
-build_flags =
-  -std=gnu++17
-  -D ARDUINO_USB_MODE=1
-  -D ARDUINO_USB_CDC_ON_BOOT=1
-  -D BOARD_HAS_PSRAM
-  -mfix-esp32-psram-cache-issue
+### Current Behavior (Intentional)
+- Left = baseHz - beatHz/2
+- Right = baseHz + beatHz/2
 
-; Waveshare module has 16MB flash & OPI PSRAM
-board_build.flash_size = 16MB
-board_build.psram_type = opi
-board_build.arduino.memory_type = opi_opi
-
-lib_deps =
-  https://github.com/esp-arduino-libs/ESP32_IO_Expander.git#v1.1.1
-  https://github.com/esp-arduino-libs/esp-lib-utils.git#v0.2.0
-  moononournation/GFX Library for Arduino @ 1.5.8
-```
-
-**Why these matter**
-
-* `BOARD_HAS_PSRAM` + `opi_opi` + cache fix → makes large framebuffers feasible and stable
-* USB CDC flags → Serial over USB works from boot (helpful for logs)
-
----
-
-## 4) Libraries Used
-
-* **Arduino_GFX** (`GFX Library for Arduino` 1.5.8) — RGB panel + display object
-* **ESP32_IO_Expander** 1.1.1 — CH422G I²C expander (backlight enable)
-* **esp‑lib‑utils** 0.2.0 — dependency for IO Expander
-
----
-
-## 5) Display Object & Timing (Arduino_GFX)
-
-* Databus: `Arduino_ESP32RGBPanel` constructed with pins/timing above
-* Display: `Arduino_RGB_Display(800, 480, panel, rotation=0, auto_flush=false)`
-
-  * We deliberately use **`auto_flush=false`** and call `gfx->flush()` **once per frame** to reduce tearing/flicker.
-
----
-
-## 6) Current App Behavior (Test UI)
-
-* Shows **Left/Right** frequency boxes based on `baseHz ± beatHz/2`
-* Header displays **Preset**, **Base**, **Beat**, and paused state
-* Animated "visualizer" bar moves with beat rate
-* **Session system**:
-
-  * States: **IDLE → RUNNING → PAUSED → DONE**
-  * **Countdown** (mm:ss), **progress bar**, adjustable **duration minutes**
-
-### Serial Controls (115200)
-
-* **Presets:** `1` Alpha, `2` Beta, `3` Theta, `4` Delta
-* **Base:** `q` +5 Hz, `a` −5 Hz (min 20 Hz)
-* **Beat:** `w` +0.5 Hz, `s` −0.5 Hz (clamped to preset range)
-* **Reset base/beat:** `r`
-* **Session:** `g` start, `p` pause/resume, `x` stop/reset, `+`/`-` minutes ±1 (1..60)
-
----
-
-## 7) Bring‑Up Checklist (Fast Recovery)
-
-1. **PSRAM Check** (Serial boot log): confirm `ESP.getPsramSize() >= 4 MB` — if not, recheck PlatformIO flags and `opi_opi` memory type
-2. **Backlight**: ensure CH422G initializes on **I²C0** (SDA=8, SCL=9) and drive **EXIO2 HIGH**
-3. **Display Init**: `gfx->begin()` must return true (let Arduino_GFX allocate framebuffers)
-4. **PCLK**: start at **16 MHz**; after stable image, move toward **30–33 MHz** as needed
-5. **Flicker**: keep `auto_flush=false`; flush once per loop; draw only dirty regions (numbers, header, progress)
-
----
-
-## 8) Common Issues & Fixes
-
-* **I²C "Invalid num" / CH422G begin() fail** → confirm I²C **pins** (8/9) and **port 0**; check pull‑ups if off‑board; ensure correct library
-* **Framebuffer "no mem"** → PSRAM not enabled or wrong memory type; verify `BOARD_HAS_PSRAM`, `psram_type=opi`, `arduino.memory_type=opi_opi`, and cache fix flag
-* **Octal flash/efuse warnings** → mismatched board settings; use the config above for Waveshare module defaults
-* **Endless reboots** → usually memory/timing mismatch; drop PCLK to 16 MHz, confirm PSRAM, remove extra allocations
-* **Flicker/tearing** → set `auto_flush=false`, single `gfx->flush()` per frame; shorten wires; try ~30–31 MHz instead of 32–33
-
----
-
-## 9) Migration Notes (LVGL Later)
-
-* Keep the **RGB panel** and **timing** the same
-* Provide an **LVGL draw buffer** in PSRAM (e.g., 1–2 partial frame buffers)
-* Implement `flush_cb` → push modified areas via Arduino_GFX; continue **single‑flush per frame** logic
-* Mirror current state model (preset/base/beat/session) as LVGL **data model** for clean UI separation
-
----
-
-## 10) Audio Transport (Planning)
-
-* **BLE‑only on S3** → no A2DP source; options:
-
-  1. I²S DAC → external **BT transmitter** → headphones
-  2. Swap to **ESP32 (Classic)** for direct A2DP source
-  3. Stay wired for lab validation
-* Keep the **binaural engine math** device‑local; transport can be swapped later
-
----
-
-## 11) Known‑Good Versions (for reproducibility)
-
-* **PlatformIO platform:** `espressif32@6.12.0`
-* **Arduino_GFX:** `1.5.8`
-* **ESP32_IO_Expander:** `v1.1.1`
-* **esp-lib-utils:** `v0.2.0`
-
-> Save this README with your project. If the build breaks, restore these exact versions and flags first.
-
----
-
-## 12) Quick "Back to Green" Steps
-
-1. Restore **platformio.ini** above
-2. Flash the last known working **`src/main.cpp`** (session UI build)
-3. Open Serial @ **115200**, confirm PSRAM + "[BL] Backlight enabled"
-4. Verify header renders; then press `1` and confirm Left ~195 Hz / Right ~205 Hz
-5. Start a 1–2 min session with `g` and watch the countdown/progress
-6. If stable, raise PCLK toward **32 MHz**, re‑test
-
----
-
-*End of README*
+Increasing Beat (Hz) widens the split around the base, so left goes down and right goes up. Alternative approach: anchor one ear to baseHz instead.
