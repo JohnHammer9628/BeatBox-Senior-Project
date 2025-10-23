@@ -214,4 +214,3 @@ This handshake is sufficient to start iterating. For production, add CRC and ver
 
 ---
 
-I will add a small `src/comms_example.cpp` stub and a sample `comms.h` if you want — which transport would you like to start with (UART JSON, compact UART binary, or DAC/CV)?
