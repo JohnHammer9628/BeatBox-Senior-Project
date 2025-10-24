@@ -3,8 +3,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <lvgl.h>
-#include <Adafruit_FT6206.h>
+#include <Adafruit_FT6206.h>   // FT6x36 family
 
+// --- Optional GT911 library; compile even if it's missing ---
 #if __has_include(<GT911.h>)
   #include <GT911.h>
   #define HAVE_GT911_LIB 1
@@ -12,17 +13,20 @@
   #define HAVE_GT911_LIB 0
 #endif
 
+// ---------------- Internals ----------------
 enum class TouchIC : uint8_t { NONE=0, FT6X36, GT911 };
 static TouchIC s_ic = TouchIC::NONE;
 static uint8_t s_addr = 0x00;
 
 static Adafruit_FT6206 s_ft;
+
 #if HAVE_GT911_LIB
   static GT911 s_gt;
 #endif
 static bool s_gt_using_lib = false;
 static lv_indev_t* s_indev = nullptr;
 
+// --- Screen geometry (from your -D’s or defaults) ---
 #ifndef TOUCH_SCREEN_W
 #define TOUCH_SCREEN_W 800
 #endif
@@ -30,9 +34,13 @@ static lv_indev_t* s_indev = nullptr;
 #define TOUCH_SCREEN_H 480
 #endif
 
-static constexpr uint16_t GT_REG_PRODUCT_ID = 0x8140;
-static constexpr uint16_t GT_REG_STATUS     = 0x814E;
-static constexpr uint16_t GT_REG_POINTS     = 0x8150;
+// --- Calibration offsets (from touch_input.h) ---
+// Positive X → shift touch RIGHT; Positive Y → shift touch DOWN
+
+// GT911 minimal raw map
+static constexpr uint16_t GT_REG_PRODUCT_ID = 0x8140; // 4 bytes ASCII
+static constexpr uint16_t GT_REG_STATUS     = 0x814E; // [7]=buf ready, [3:0]=points
+static constexpr uint16_t GT_REG_POINTS     = 0x8150; // first point block
 
 struct GTPointRaw {
   uint16_t x;
@@ -42,6 +50,7 @@ struct GTPointRaw {
   uint8_t  reserved;
 } __attribute__((packed));
 
+/* Apply orientation AND calibration offsets, then clamp */
 static inline void orient_map(int16_t& x, int16_t& y) {
 #if TOUCH_SWAP_XY
   int16_t t=x; x=y; y=t;
@@ -52,11 +61,18 @@ static inline void orient_map(int16_t& x, int16_t& y) {
 #if TOUCH_INVERT_Y
   y = TOUCH_SCREEN_H - 1 - y;
 #endif
+
+  // ---- Calibration offsets (NEW) ----
+  x += TOUCH_X_OFFSET;
+  y += TOUCH_Y_OFFSET;
+
+  // Clamp to screen bounds
   if (x < 0) x = 0; if (y < 0) y = 0;
   if (x >= TOUCH_SCREEN_W) x = TOUCH_SCREEN_W - 1;
   if (y >= TOUCH_SCREEN_H) y = TOUCH_SCREEN_H - 1;
 }
 
+// -------- I2C helpers --------
 static bool i2c_probe(uint8_t addr) {
   Wire.beginTransmission(addr);
   return (Wire.endTransmission() == 0);
@@ -76,6 +92,7 @@ static bool i2c_read(uint8_t addr, const uint8_t* reg, size_t reg_len, uint8_t* 
   return true;
 }
 
+// -------- Bus recovery (if SDA stuck low) --------
 bool i2c_bus_recover(uint8_t sclPin, uint8_t sdaPin) {
   Wire.end();
   pinMode(sclPin, INPUT_PULLUP);
@@ -88,12 +105,14 @@ bool i2c_bus_recover(uint8_t sclPin, uint8_t sdaPin) {
     return true;
   }
 
+  // SDA low: clock SCL to free it
   pinMode(sclPin, OUTPUT);
   for (int i=0; i<16 && (digitalRead(sdaPin)==LOW); ++i) {
     digitalWrite(sclPin, HIGH); delayMicroseconds(5);
     digitalWrite(sclPin, LOW ); delayMicroseconds(5);
   }
 
+  // STOP condition
   pinMode(sdaPin, OUTPUT);
   digitalWrite(sdaPin, LOW);  delayMicroseconds(5);
   digitalWrite(sclPin, HIGH); delayMicroseconds(5);
@@ -116,6 +135,7 @@ void i2c_full_scan_print(Stream& out) {
   out.println();
 }
 
+// -------- Reset/INT helpful sequence (if wired) --------
 static void touch_hw_reset_sequence() {
   if (TOUCH_RST_PIN >= 0) {
     pinMode(TOUCH_RST_PIN, OUTPUT);
@@ -124,6 +144,8 @@ static void touch_hw_reset_sequence() {
   if (TOUCH_INT_PIN >= 0) {
     pinMode(TOUCH_INT_PIN, INPUT_PULLUP);
   }
+
+  // Simple GT911-friendly reset pulse; harmless for FT6x36
   if (TOUCH_RST_PIN >= 0) {
     if (TOUCH_INT_PIN >= 0) { pinMode(TOUCH_INT_PIN, OUTPUT); digitalWrite(TOUCH_INT_PIN, LOW); }
     digitalWrite(TOUCH_RST_PIN, LOW);  delay(10);
@@ -132,6 +154,7 @@ static void touch_hw_reset_sequence() {
   }
 }
 
+// -------- Detection --------
 static void detect_ic() {
   touch_hw_reset_sequence();
 
@@ -142,9 +165,10 @@ static void detect_ic() {
   Serial.printf("[touch][probe] 0x38=%d 0x5D=%d 0x14=%d\n", has_ft, has_gt5d, has_gt14);
 
   if (has_ft) {
+    // Extra sanity: some boards pull 0x38 but aren’t FT; quick ID read (best-effort)
     uint8_t chip = 0, vend = 0;
-    uint8_t regc[1] = { 0xA8 };
-    uint8_t regv[1] = { 0xA3 };
+    uint8_t regc[1] = { 0xA8 }; // CHIPID
+    uint8_t regv[1] = { 0xA3 }; // VENDID
     if (i2c_read(0x38, regc, 1, &chip, 1) && i2c_read(0x38, regv, 1, &vend, 1)) {
       Serial.printf("[touch][FT] CHIPID=0x%02X VENDID=0x%02X\n", chip, vend);
       if (chip == 0x06 || chip == 0x36) {
@@ -160,19 +184,20 @@ static void detect_ic() {
     s_ic = TouchIC::GT911; s_addr = has_gt5d ? 0x5D : 0x14;
     Serial.printf("[touch] GT911 selected @ 0x%02X\n", s_addr);
 
+    // Product ID read
     uint8_t idbuf[4] = {0};
     uint8_t reg[2] = { uint8_t(GT_REG_PRODUCT_ID>>8), uint8_t(GT_REG_PRODUCT_ID & 0xFF) };
     if (i2c_read(s_addr, reg, 2, idbuf, 4)) {
       Serial.printf("[touch][GT] Product ID: %c%c%c%c\n", idbuf[0], idbuf[1], idbuf[2], idbuf[3]);
     }
 
-    // cfg read is optional; some firmwares return junk—ignore in UI
+    // Resolution read (0x8048 little-endian X, 0x804A little-endian Y) – many panels report odd values; for log only
     uint8_t cfg_reg[2] = { 0x80, 0x47 };
     uint8_t cfg[8] = {0};
     if (i2c_read(s_addr, cfg_reg, 2, cfg, 7)) {
       uint16_t x = (uint16_t)cfg[2] | ((uint16_t)cfg[3] << 8);
       uint16_t y = (uint16_t)cfg[4] | ((uint16_t)cfg[5] << 8);
-      Serial.printf("[touch][GT] cfg: %u x %u\n", x, y);
+      Serial.printf("[touch][GT] cfg (raw): %u x %u (ignored for mapping)\n", x, y);
     }
     return;
   }
@@ -181,6 +206,7 @@ static void detect_ic() {
   Serial.println(F("[touch] No FT/GT touch IC found (0x38/0x5D/0x14)"));
 }
 
+// -------- LVGL read cb --------
 static void touch_read_cb(lv_indev_t*, lv_indev_data_t* data) {
   data->continue_reading = false;
   data->point.x = 0; data->point.y = 0;
@@ -210,6 +236,7 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* data) {
     } else
 #endif
     {
+      // raw minimal read (with robust ack/clear)
       uint8_t status = 0;
       uint8_t regS[2] = { uint8_t(GT_REG_STATUS>>8), uint8_t(GT_REG_STATUS & 0xFF) };
       if (i2c_read(s_addr, regS, 2, &status, 1)) {
@@ -217,14 +244,23 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* data) {
         bool buf_ready = status & 0x80;
 
         if (buf_ready) {
+          // Try read first point anyway
           uint8_t regP[2] = { uint8_t(GT_REG_POINTS>>8), uint8_t(GT_REG_POINTS & 0xFF) };
           GTPointRaw pr{};
           if (i2c_read(s_addr, regP, 2, (uint8_t*)&pr, sizeof(pr))) {
             if (n > 0 && pr.x != 0xFFFF && pr.y != 0xFFFF) {
               x = (int16_t)pr.x; y = (int16_t)pr.y; pressed = true;
             }
+            // Periodic debug
+            static uint32_t last_dump = 0;
+            uint32_t now = millis();
+            if (now - last_dump > 700) {
+              Serial.printf("[touch][GT] status=0x%02X n=%u peek: x=%u y=%u id=%u size=%u\n",
+                            status, n, pr.x, pr.y, pr.id, pr.size);
+              last_dump = now;
+            }
           }
-          // Always ACK/CLEAR
+          // ACK/CLEAR the buffer-ready flag ALWAYS
           (void)i2c_write_u8(s_addr, GT_REG_STATUS, 0x00);
         }
       }
@@ -238,12 +274,14 @@ static void touch_read_cb(lv_indev_t*, lv_indev_data_t* data) {
   }
 }
 
+// -------- Public API --------
 void touch_init_and_register_lvgl() {
+  // Ensure Wire is alive and bus released
   Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL);
-  Wire.setClock(100000);
+  Wire.setClock(TOUCH_I2C_FREQ);
   delay(3);
-  (void)i2c_bus_recover();
-  i2c_full_scan_print(Serial);
+  (void)i2c_bus_recover(); // harmless if bus already free
+  i2c_full_scan_print(Serial);   // log addresses
 
   detect_ic();
 
@@ -266,12 +304,14 @@ void touch_init_and_register_lvgl() {
   }
 
   if (s_ic != TouchIC::NONE) {
+    // Speed up after detection if you like (stays at header-defined freq)
     Wire.setClock(TOUCH_I2C_FREQ);
     s_indev = lv_indev_create();
     lv_indev_set_type(s_indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(s_indev, touch_read_cb);
-    Serial.printf("[touch] LVGL indev registered (%s @ 0x%02X)  I2C=%lu Hz\n",
-                  (s_ic==TouchIC::FT6X36 ? "FT6x36":"GT911"), s_addr, (unsigned long)TOUCH_I2C_FREQ);
+    Serial.printf("[touch] LVGL indev registered (%s @ 0x%02X)  I2C=%u Hz\n",
+                  (s_ic==TouchIC::FT6X36 ? "FT6x36":"GT911"), s_addr, (unsigned)TOUCH_I2C_FREQ);
+    Serial.printf("[touch] Calibration offsets: X=%d  Y=%d\n", (int)TOUCH_X_OFFSET, (int)TOUCH_Y_OFFSET);
   } else {
     Serial.println(F("[touch] Skipping LVGL indev (no touch detected)"));
   }
@@ -279,8 +319,10 @@ void touch_init_and_register_lvgl() {
 
 bool touch_present() { return s_ic != TouchIC::NONE; }
 const char* touch_ic_name() {
-  switch (s_ic) { case TouchIC::FT6X36: return "FT6x36";
-                  case TouchIC::GT911:  return "GT911";
-                  default:              return "NONE"; }
+  switch (s_ic) {
+    case TouchIC::FT6X36: return "FT6x36";
+    case TouchIC::GT911:  return "GT911";
+    default:              return "NONE";
+  }
 }
 uint8_t touch_i2c_address() { return s_addr; }
